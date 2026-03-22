@@ -1,0 +1,14 @@
+torch>=2.0.0
+transformers>=4.30.0
+accelerate
+bitsandbytes
+langgraph
+langgraph-checkpoint
+uvicorn
+fastapi
+pydantic
+scipy
+numpy
+requests
+huggingface_hub
+git+https://github.com/xioTechnologies/Fusion.git@main#egg=imufusion
