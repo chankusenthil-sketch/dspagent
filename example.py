@@ -40,7 +40,7 @@ print(f"Logging to {log_filename}\n")
 
 result = run_agent(
     csv_path="data/samples/imu_walking_subject1.csv",
-    user_goal="What activity is the person performing? Estimate the step frequency.",
+    user_goal="Where is the device attached to person's body?",
     fs=50.0,                        # sampling rate in Hz
     max_iterations=3,               # max plan→execute loops
     thread_id=str(uuid.uuid4()),    # unique thread for checkpointing
@@ -58,6 +58,7 @@ print(f"Tools executed ({len(tool_results)}):")
 for tr in tool_results:
     print(f"  - {tr['tool']}  args={tr.get('args', {})}")
 
+'''
 # ── 3. Run on a different file with a different goal ────────────────────────
 
 result2 = run_agent(
@@ -70,7 +71,7 @@ result2 = run_agent(
 
 print("\n── Second Run ──")
 print("Answer:", result2.get("final_answer", "N/A"))
-
+'''
 # ── Cleanup ─────────────────────────────────────────────────────────────────
 
 sys.stdout = original_stdout

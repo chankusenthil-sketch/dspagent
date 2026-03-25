@@ -18,10 +18,14 @@ import os
 import json
 import re
 import csv
+import logging
 import numpy as np
+from datetime import datetime
 from typing import Any, Dict, List, TypedDict, Annotated
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 
 from llm_client import LLHTTPClient
 from tools.scipy_tool import SciPyDSPTool, TOOL_REGISTRY
@@ -46,11 +50,16 @@ class AgentState(TypedDict):
 
     # Planning & execution loop
     plan: str                    # current LLM plan text
+    plan_history: list           # previous plan texts for LLM context across iterations
     tool_queue: list             # list of tool calls to execute
     current_tool: dict           # the tool being executed now
     tool_results: list           # accumulated results from all tools
+    intermediate_results: dict   # name → np.ndarray from previous tool outputs (for chaining)
     iteration: int               # current planning iteration
     max_iterations: int          # safety limit
+
+    # Conversation trace (LangChain messages between nodes)
+    messages: Annotated[list, add_messages]
 
     # Final output
     final_answer: str
@@ -69,6 +78,41 @@ except ImportError:
 
 # Merge IMU Fusion tools into the unified registry
 TOOL_REGISTRY.update(IMU_TOOL_REGISTRY)
+
+# ---------------------------------------------------------------------------
+# Conversation logger (separate from debug/print log)
+# ---------------------------------------------------------------------------
+
+_CONV_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_CONV_LOG_DIR, exist_ok=True)
+
+conv_logger = logging.getLogger("dsp_agent.conversation")
+conv_logger.setLevel(logging.INFO)
+conv_logger.propagate = False  # don't pollute root logger
+
+def _init_conv_log(tag: str = "") -> None:
+    """Create a fresh file handler for each agent run."""
+    # Remove old handlers
+    for h in conv_logger.handlers[:]:
+        conv_logger.removeHandler(h)
+        h.close()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = f"_{tag}" if tag else ""
+    path = os.path.join(_CONV_LOG_DIR, f"dsp_conversation_{ts}{suffix}.log")
+    fh = logging.FileHandler(path, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
+    conv_logger.addHandler(fh)
+    conv_logger.info("=== Conversation trace started ===")
+    return path
+
+def _log_message(msg) -> None:
+    """Log a single LangChain message to the conversation log."""
+    role = msg.__class__.__name__.replace("Message", "").upper()
+    content = msg.content
+    # Truncate very long tool outputs for readability
+    if len(content) > 2000:
+        content = content[:2000] + f"\n... [truncated, {len(msg.content)} chars total]"
+    conv_logger.info(f"[{role}] {content}")
 
 # ---------------------------------------------------------------------------
 # Prompt loading
@@ -103,10 +147,10 @@ def call_llm(prompt: str, max_tokens: int = 1024, temperature: float = 0.3,
 
 
 def format_tool_list() -> str:
-    """Format available tools as text for the LLM prompt."""
+    """Format available tools as a numbered list for the LLM prompt."""
     lines = []
-    for name, info in TOOL_REGISTRY.items():
-        lines.append(f"- {name}: {info['description']}")
+    for i, (name, info) in enumerate(TOOL_REGISTRY.items(), 1):
+        lines.append(f"{i}. {name}: {info['description']}")
     return "\n".join(lines)
 
 
@@ -153,7 +197,12 @@ def parse_tool_calls(llm_text: str) -> List[Dict[str, Any]]:
                 tools.append({"tool": current_tool, "args": current_args, "data_source": current_data})
             raw_name = tool_match.group(1).strip().lower()
             # Fuzzy match against registry
-            current_tool = _fuzzy_match_tool(raw_name)
+            matched = _fuzzy_match_tool(raw_name)
+            if matched is None:
+                print(f"  [Skip] Ignoring unknown tool '{raw_name}'")
+                current_tool = None
+            else:
+                current_tool = matched
             current_args = {}
             current_data = "acc"
 
@@ -161,6 +210,9 @@ def parse_tool_calls(llm_text: str) -> List[Dict[str, Any]]:
             args_match = args_pattern.search(line[tool_match.end():])
             if args_match:
                 current_args = _parse_args(args_match.group(1))
+                # If data=<name> was embedded in ARGS, use it as data source
+                if "_data_source" in current_args:
+                    current_data = current_args.pop("_data_source")
             data_match = data_pattern.search(line[tool_match.end():])
             if data_match:
                 current_data = data_match.group(1).strip().lower()
@@ -171,11 +223,11 @@ def parse_tool_calls(llm_text: str) -> List[Dict[str, Any]]:
             args_match = args_pattern.search(line)
             if args_match and not tool_match:
                 current_args = _parse_args(args_match.group(1))
+                if "_data_source" in current_args:
+                    current_data = current_args.pop("_data_source")
             data_match = data_pattern.search(line)
             if data_match:
-                d = data_match.group(1).strip().lower()
-                if d in ("acc", "gyro"):
-                    current_data = d
+                current_data = data_match.group(1).strip().lower()
 
     # Don't forget the last tool
     if current_tool:
@@ -232,31 +284,95 @@ def parse_tool_calls(llm_text: str) -> List[Dict[str, Any]]:
     return tools
 
 
+def _levenshtein(s: str, t: str) -> int:
+    """Compute Levenshtein edit distance between two strings."""
+    if len(s) < len(t):
+        return _levenshtein(t, s)
+    if len(t) == 0:
+        return len(s)
+    prev = list(range(len(t) + 1))
+    for i, sc in enumerate(s):
+        curr = [i + 1]
+        for j, tc in enumerate(t):
+            cost = 0 if sc == tc else 1
+            curr.append(min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost))
+        prev = curr
+    return prev[-1]
+
+
 def _fuzzy_match_tool(raw_name: str) -> str | None:
-    """Fuzzy match a (possibly misspelled) tool name to the registry."""
-    # Exact match
+    """Fuzzy match a (possibly misspelled) tool name to the registry.
+
+    Match strategy (first match wins):
+    1. Exact match against TOOL_REGISTRY keys.
+    2. Normalized match — strip underscores/hyphens/spaces from both sides.
+    3. Containment match — check if a registered tool name (normalized) is a
+       substring of the raw name (normalized), or vice-versa.  Pick the
+       longest matching registered name to avoid short-name false positives.
+       Both raw name and registered name must be >= 6 chars (normalized).
+    4. Typo match — allow up to 2 character edits (Levenshtein) between
+       normalized names.  Only considered when names are similar length.
+    """
+    # 1. Exact match
     if raw_name in TOOL_REGISTRY:
         return raw_name
-    # Normalize: remove underscores, lowercase
-    normalized = raw_name.replace("_", "").replace("-", "")
+
+    # 2. Normalized match: remove underscores/hyphens/spaces, lowercase
+    normalized = raw_name.replace("_", "").replace("-", "").replace(" ", "")
     for registered in TOOL_REGISTRY:
         if registered.replace("_", "") == normalized:
+            print(f"  [Fuzzy] '{raw_name}' matched to '{registered}'")
             return registered
-    # Prefix match
-    for registered in TOOL_REGISTRY:
-        if registered.startswith(raw_name[:5]):
-            return registered
-    # Substring match
-    for registered in TOOL_REGISTRY:
-        if raw_name[:4] in registered:
-            return registered
+
+    # 3. Containment match — longest registered name wins
+    if len(normalized) >= 6:
+        best: str | None = None
+        best_len = 0
+        for registered in TOOL_REGISTRY:
+            reg_norm = registered.replace("_", "")
+            if len(reg_norm) < 6:
+                continue
+            if reg_norm in normalized or normalized in reg_norm:
+                if len(reg_norm) > best_len:
+                    best = registered
+                    best_len = len(reg_norm)
+        if best is not None:
+            print(f"  [Fuzzy] '{raw_name}' matched to '{best}' (containment)")
+            return best
+
+    # 4. Typo match — Levenshtein distance <= 2 for similar-length names
+    if len(normalized) >= 6:
+        best_typo: str | None = None
+        best_dist = 3  # threshold: accept dist <= 2
+        for registered in TOOL_REGISTRY:
+            reg_norm = registered.replace("_", "")
+            # Only consider names of similar length (within 2 chars)
+            if abs(len(reg_norm) - len(normalized)) > 2:
+                continue
+            dist = _levenshtein(normalized, reg_norm)
+            if dist < best_dist:
+                best_dist = dist
+                best_typo = registered
+        if best_typo is not None:
+            print(f"  [Fuzzy] '{raw_name}' matched to '{best_typo}' (typo, dist={best_dist})")
+            return best_typo
+
+    print(f"  [Skip] No match for tool '{raw_name}'")
     return None
 
 
 def _parse_args(args_str: str) -> dict:
-    """Parse argument string like 'fs=50, cutoff=10' into a dict."""
-    args = {}
-    # Remove non-arg text
+    """Parse argument string like 'fs=50, cutoff=10' into a dict.
+
+    If the args string contains 'data=<name>', it is extracted and stored
+    under the special key '_data_source' so the caller can use it for
+    tool-output chaining.
+    """
+    args: Dict[str, Any] = {}
+    # Extract data=<name> before removing it
+    data_match = re.search(r'data\s*=\s*(\w+)', args_str, flags=re.IGNORECASE)
+    if data_match:
+        args["_data_source"] = data_match.group(1).strip().lower()
     args_str = re.sub(r'data\s*=\s*\w+', '', args_str, flags=re.IGNORECASE)
     for part in re.split(r'[,;]', args_str):
         part = part.strip()
@@ -337,9 +453,15 @@ def load_signal(state: AgentState) -> dict:
         "fs": fs,
         "signal_info": signal_info,
         "tool_results": [],
+        "intermediate_results": {},
+        "plan_history": [],
         "iteration": 0,
         "max_iterations": state.get("max_iterations", 5),
         "error": "",
+        "messages": [
+            HumanMessage(content=f"Goal: {state['user_goal']}\nFile: {state['csv_path']}"),
+            AIMessage(content=f"[load_signal] {signal_info}"),
+        ],
     }
 
 
@@ -347,6 +469,7 @@ def plan(state: AgentState) -> dict:
     """LLM plans what DSP tools to use next based on the goal and current results."""
     iteration = state.get("iteration", 0)
     tool_results = state.get("tool_results", [])
+    plan_history = state.get("plan_history", [])
 
     # Build context for LLM — feed full tool results (Mistral supports 32K tokens)
     results_text = ""
@@ -355,13 +478,33 @@ def plan(state: AgentState) -> dict:
         for r in tool_results:
             results_text += f"- {r['tool']}: {r['summary']}\n"
 
+    # Build plan history context so LLM can refine strategy across iterations
+    history_text = ""
+    if plan_history:
+        history_text = "\nYour previous plans:\n"
+        for i, prev_plan in enumerate(plan_history):
+            history_text += f"--- Iteration {i} ---\n{prev_plan}\n"
+
+    # Build intermediate results listing so LLM knows what chained data is available
+    intermediate_results = state.get("intermediate_results", {})
+    intermediates_text = ""
+    if intermediate_results:
+        intermediates_text = "\nAvailable intermediate data (use as DATA source for chaining):\n"
+        for name, arr in intermediate_results.items():
+            if isinstance(arr, np.ndarray):
+                intermediates_text += f"- {name}  shape={arr.shape}\n"
+            else:
+                intermediates_text += f"- {name}\n"
+
     # Load prompt template from prompts/plan.md
     template = _load_prompt("plan")
     prompt = template.format(
         signal_info=state.get('signal_info', ''),
         user_goal=state['user_goal'],
         results_text=results_text,
+        plan_history=history_text,
         tool_list=format_tool_list(),
+        intermediates_text=intermediates_text,
     )
 
     llm_response = call_llm(prompt, max_tokens=1024, temperature=0.2)
@@ -371,38 +514,133 @@ def plan(state: AgentState) -> dict:
     if is_done(llm_response) and len(tool_results) > 0:
         return {
             "plan": llm_response,
+            "plan_history": plan_history + [llm_response],
             "tool_queue": [],
             "iteration": iteration + 1,
+            "messages": [
+                AIMessage(content=f"[plan iter={iteration}] LLM says DONE.\n{llm_response}"),
+            ],
         }
 
     # Parse tool calls
     tools = parse_tool_calls(llm_response)
+    tool_names = [t["tool"] for t in tools]
 
     return {
         "plan": llm_response,
+        "plan_history": plan_history + [llm_response],
         "tool_queue": tools,
         "iteration": iteration + 1,
+        "messages": [
+            AIMessage(content=f"[plan iter={iteration}] Tools chosen: {tool_names}\n{llm_response}"),
+        ],
     }
 
 
 def execute_tool(state: AgentState) -> dict:
     """Execute all queued DSP tools and collect results."""
+    # Mapping from tool name to the dict key holding its primary array output.
+    # Used to auto-store intermediate results for tool-output chaining.
+    _INTERMEDIATE_KEYS: Dict[str, str] = {
+        "imu_linear_acceleration": "linear_acceleration",
+        "imu_earth_acceleration": "earth_acceleration",
+        "imu_orientation": "quaternions",
+        "imu_euler_angles": "euler_angles",
+        "imu_gravity": "gravity",
+    }
+
+    # Reverse mapping: intermediate name -> tool that produces it.
+    # Used for auto-resolving missing prerequisites (one level deep).
+    # Only parameter-free IMU fusion tools are auto-resolvable.
+    _PREREQUISITE_TOOLS: Dict[str, str] = {
+        "linear_acceleration": "imu_linear_acceleration",
+        "earth_acceleration": "imu_earth_acceleration",
+        "quaternions": "imu_orientation",
+        "euler_angles": "imu_euler_angles",
+        "gravity": "imu_gravity",
+    }
+
     tool_queue = state.get("tool_queue", [])
     tool_results = list(state.get("tool_results", []))
     acc = state.get("acc")
     gyro = state.get("gyro")
     fs = state.get("fs", 50.0)
     timestamps = state.get("timestamps")
+    intermediate_results: Dict[str, Any] = dict(state.get("intermediate_results", {}))
+    results_before = len(tool_results)
 
     for tool_call in tool_queue:
         tool_name = tool_call["tool"]
         args = tool_call.get("args", {})
         data_source = tool_call.get("data_source", "acc")
 
-        # Select data
-        if data_source == "gyro":
+        # Select data — check intermediate results first, then fall back to raw
+        if data_source in intermediate_results:
+            data = intermediate_results[data_source]
+        elif data_source == "gyro":
             data = gyro
+        elif data_source == "acc":
+            data = acc
+        elif data_source in _PREREQUISITE_TOOLS:
+            # Auto-resolve: run the prerequisite IMU fusion tool to produce the data
+            prereq_name = _PREREQUISITE_TOOLS[data_source]
+            print(f"  [Auto] Running prerequisite '{prereq_name}' to produce '{data_source}'")
+            if imu_fusion is None:
+                tool_results.append({
+                    "tool": tool_name,
+                    "summary": f"Error: need '{prereq_name}' for '{data_source}' but imufusion not installed",
+                    "raw": None,
+                })
+                continue
+            prereq_method = getattr(imu_fusion, prereq_name, None)
+            if prereq_method is None:
+                tool_results.append({
+                    "tool": tool_name,
+                    "summary": f"Error: prerequisite tool '{prereq_name}' not found",
+                    "raw": None,
+                })
+                continue
+            try:
+                prereq_result = prereq_method(acc=acc, gyro=gyro, timestamps=timestamps)
+                # Store all arrays from the prerequisite result
+                if isinstance(prereq_result, dict):
+                    key = _INTERMEDIATE_KEYS.get(prereq_name)
+                    if key and key in prereq_result and isinstance(prereq_result[key], np.ndarray):
+                        intermediate_results[key] = prereq_result[key]
+                    for rk, rv in prereq_result.items():
+                        if isinstance(rv, np.ndarray):
+                            intermediate_results[f"{prereq_name}_{rk}"] = rv
+                elif isinstance(prereq_result, np.ndarray):
+                    intermediate_results[data_source] = prereq_result
+                # Log the auto-resolved prerequisite
+                prereq_summary = _summarize_result(prereq_name, prereq_result, "acc")
+                tool_results.append({
+                    "tool": prereq_name,
+                    "summary": f"(auto) {prereq_summary}",
+                    "raw": prereq_result if not isinstance(prereq_result, np.ndarray) else None,
+                    "data_source": "acc",
+                })
+                print(f"  [Auto] {prereq_name}(acc): {prereq_summary}")
+            except Exception as e:
+                tool_results.append({
+                    "tool": tool_name,
+                    "summary": f"Error: auto-prerequisite '{prereq_name}' failed: {str(e)}",
+                    "raw": None,
+                })
+                continue
+            # Now fetch the data we needed
+            if data_source in intermediate_results:
+                data = intermediate_results[data_source]
+            else:
+                tool_results.append({
+                    "tool": tool_name,
+                    "summary": f"Error: prerequisite '{prereq_name}' did not produce '{data_source}'",
+                    "raw": None,
+                })
+                continue
         else:
+            # Unknown data source — fall back to acc with a warning
+            print(f"  [Warn] Unknown data source '{data_source}', falling back to acc")
             data = acc
 
         if data is None:
@@ -460,6 +698,20 @@ def execute_tool(state: AgentState) -> dict:
 
                 result = method(**kwargs)
 
+            # Store intermediate results for tool-output chaining
+            if isinstance(result, np.ndarray):
+                inter_name = f"{tool_name}_{data_source}"
+                intermediate_results[inter_name] = result
+            elif isinstance(result, dict):
+                if tool_name in _INTERMEDIATE_KEYS:
+                    key = _INTERMEDIATE_KEYS[tool_name]
+                    if key in result and isinstance(result[key], np.ndarray):
+                        intermediate_results[key] = result[key]
+                # Also store any array values with descriptive names
+                for rk, rv in result.items():
+                    if isinstance(rv, np.ndarray):
+                        intermediate_results[f"{tool_name}_{rk}"] = rv
+
             # Summarize result for LLM consumption
             summary = _summarize_result(tool_name, result, data_source)
             tool_results.append({
@@ -477,7 +729,22 @@ def execute_tool(state: AgentState) -> dict:
                 "raw": None,
             })
 
-    return {"tool_results": tool_results, "tool_queue": []}
+    # Build ToolMessages for conversation trace
+    tool_messages = []
+    for tr in tool_results[results_before:]:
+        tool_messages.append(
+            ToolMessage(
+                content=f"[{tr['tool']}] {tr['summary']}",
+                tool_call_id=tr["tool"],
+            )
+        )
+
+    return {
+        "tool_results": tool_results,
+        "tool_queue": [],
+        "messages": tool_messages,
+        "intermediate_results": intermediate_results,
+    }
 
 
 def _summarize_result(tool_name: str, result: Any, data_source: str) -> str:
@@ -530,7 +797,12 @@ def summarize(state: AgentState) -> dict:
     answer = call_llm(prompt, max_tokens=2048, temperature=0.2)
     print(f"\n[Final Answer] LLM:\n{answer}\n")
 
-    return {"final_answer": answer}
+    return {
+        "final_answer": answer,
+        "messages": [
+            AIMessage(content=f"[summarize] Final Answer:\n{answer}"),
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +895,9 @@ def run_agent(csv_path: str, user_goal: str, fs: float = 0.0, max_iterations: in
     Returns:
         Final agent state with results
     """
+    # Initialize a dedicated conversation log file for this run
+    conv_log_path = _init_conv_log(tag=thread_id[:8] if thread_id != "default" else "")
+
     agent, config = create_agent(thread_id)
 
     initial_state = {
@@ -638,6 +913,12 @@ def run_agent(csv_path: str, user_goal: str, fs: float = 0.0, max_iterations: in
     print(f"{'='*50}")
 
     result = agent.invoke(initial_state, config)
+
+    # Flush all LangChain messages to the conversation log
+    for msg in result.get("messages", []):
+        _log_message(msg)
+    conv_logger.info("=== Conversation trace ended ===")
+    print(f"\nConversation log: {conv_log_path}")
 
     print(f"\n{'='*50}")
     print(f"FINAL ANSWER:\n{result.get('final_answer', 'No answer generated')}")
