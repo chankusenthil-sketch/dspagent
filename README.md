@@ -266,13 +266,14 @@ dspagent/
 │
 ├── data/
 │   ├── download_har_dataset.py  Download UCI HAR dataset + create CSVs
-│   ├── samples/                 Sample CSV files (one per activity)
+│   ├── samples/                 Sample IMU CSV files (12 files, multiple activities/subjects)
 │   └── UCI HAR Dataset/         Raw dataset (created by download script)
 │
 │
 └── models/
-    ├── Mistral-7B-Instruct-v0.3/   Primary LLM (instruction-tuned)
-    └── opt-6.7b/                    Fallback base model
+    ├── Llama-3.1-8B-Instruct/       Primary LLM (default — instruction-tuned, 128K context)
+    ├── Mistral-7B-Instruct-v0.3/    Alternative LLM (instruction-tuned)
+    └── opt-6.7b/                     Fallback base model
 ```
 
 ---
@@ -344,16 +345,18 @@ All templates use Python `str.format()` placeholders.
 
 | Model | Type | Size | Notes |
 |-------|------|------|-------|
-| **Mistral-7B-Instruct-v0.3** | Instruction-tuned | 14.5 GB (fp16) | Primary — follows structured tool-call format, coherent analysis |
+| **Llama-3.1-8B-Instruct** | Instruction-tuned | ~16 GB (fp16) | **Default** — excellent structured output, 128K context window |
+| Mistral-7B-Instruct-v0.3 | Instruction-tuned | 14.5 GB (fp16) | Alternative — follows structured tool-call format, coherent analysis |
 | facebook/opt-6.7b | Base completion | 13 GB (fp16) | Fallback — less structured, requires keyword-based parsing |
+| meta-llama/Llama-2-13b-hf | Base completion | ~26 GB (fp16) | Optional — larger model, requires more VRAM |
 
-**Context window:** Mistral-7B supports **32,768 tokens**. Full tool data is fed to the LLM without truncation.
+**Context window:** Llama 3.1 supports **128,000 tokens**. Mistral-7B supports 32,768 tokens. Full tool data is fed to the LLM without truncation.
 
 ---
 
 ## Supported NVIDIA Hardware
 
-Mistral-7B-Instruct in fp16 requires ~14.5 GB VRAM. Any NVIDIA GPU with sufficient memory can run the DSP Agent.
+Llama-3.1-8B-Instruct in fp16 requires ~16 GB VRAM. Mistral-7B-Instruct requires ~14.5 GB. Any NVIDIA GPU with sufficient memory can run the DSP Agent.
 
 ### Recommended GPUs
 
@@ -363,8 +366,8 @@ Mistral-7B-Instruct in fp16 requires ~14.5 GB VRAM. Any NVIDIA GPU with sufficie
 | **NVIDIA DGX H100** | 80 GB per GPU | Latest DGX; highest throughput for inference |
 | **NVIDIA DGX B200** | 192 GB per GPU | Next-gen Blackwell DGX |
 | **NVIDIA DGX Spark** | 128 GB unified | Desktop AI supercomputer; large unified memory pool |
-| **NVIDIA RTX 4090** | 24 GB | Consumer flagship; comfortably fits Mistral-7B fp16 |
-| **NVIDIA RTX 4080** | 16 GB | Fits Mistral-7B fp16 with limited headroom |
+| **NVIDIA RTX 4090** | 24 GB | Consumer flagship; comfortably fits Llama-3.1-8B fp16 |
+| **NVIDIA RTX 4080** | 16 GB | Fits Llama-3.1-8B / Mistral-7B fp16 with limited headroom |
 | **NVIDIA RTX 6000 Ada** | 48 GB | Professional workstation GPU |
 | **NVIDIA A100 (standalone)** | 40/80 GB | Cloud and on-prem inference standard |
 | **NVIDIA H100 (standalone)** | 80 GB | High-throughput inference |
@@ -395,11 +398,13 @@ The `download_model.py` script supports presets and custom repo IDs.
 # List available presets
 python scripts/download_model.py --list
 
-# Download Mistral-7B-Instruct (default)
-python scripts/download_model.py
+# Download Llama-3.1-8B-Instruct (recommended — default server model)
+python scripts/download_model.py --preset llama3
 
-# Download using a named preset
+# Download Mistral-7B-Instruct
 python scripts/download_model.py --preset mistral
+
+# Download using other presets
 python scripts/download_model.py --preset opt
 python scripts/download_model.py --preset llama2
 
@@ -412,7 +417,8 @@ python scripts/download_model.py --preset opt --out /tmp/my-model
 
 | Preset | Repo ID | Notes |
 |--------|---------|-------|
-| `mistral` | `mistralai/Mistral-7B-Instruct-v0.3` | **Default** — recommended, instruction-tuned |
+| `llama3` | `meta-llama/Llama-3.1-8B-Instruct` | **Default server model** — requires HF token with Llama access |
+| `mistral` | `mistralai/Mistral-7B-Instruct-v0.3` | Alternative — instruction-tuned |
 | `opt` | `facebook/opt-6.7b` | No HF token needed |
 | `llama2` | `meta-llama/Llama-2-13b-hf` | Requires HF token with Llama access |
 
@@ -421,19 +427,19 @@ The script reads a HuggingFace token from `hf_token.txt` if present.
 ### 3. Start the LLM Server
 
 ```bash
-# Default (auto-detects Mistral-7B-Instruct)
+# Default (loads Llama-3.1-8B-Instruct)
 python scripts/start_llm_server.py
 
 # Or specify a different model
-MODEL_DIR="models/opt-6.7b" python scripts/start_llm_server.py
+MODEL_DIR="models/Mistral-7B-Instruct-v0.3" python scripts/start_llm_server.py
 ```
 
-The server starts on `http://0.0.0.0:8080`.
+The server starts on `http://0.0.0.0:8081`.
 
 ### 4. Verify the Server
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:8081/health
 ```
 
 Expected response:
@@ -474,12 +480,17 @@ This creates sample CSV files in `data/samples/`:
 | File | Activity |
 |------|----------|
 | `imu_walking_subject1.csv` | Walking |
+| `imu_walking_subject2.csv` | Walking (second subject, different gait) |
 | `imu_sitting_subject1.csv` | Sitting |
 | `imu_standing_subject1.csv` | Standing |
 | `imu_laying_subject1.csv` | Laying |
 | `imu_walking_upstairs_subject1.csv` | Walking upstairs |
 | `imu_walking_downstairs_subject1.csv` | Walking downstairs |
-| `imu_multi_activity.csv` | Multiple activities |
+| `imu_jogging_subject1.csv` | Jogging (high-frequency rhythmic motion) |
+| `imu_cycling_subject1.csv` | Cycling (repetitive pedaling) |
+| `imu_elevator_subject1.csv` | Elevator ride (static with vertical acceleration changes) |
+| `imu_multi_activity.csv` | Multiple activities (sequential) |
+| `imu_transition_activity.csv` | Activity transitions (sitting → standing → walking → jogging → standing) |
 
 **CSV format:** `timestamp, acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z, activity`
 **Sampling rate:** 50 Hz, 128 samples per window (2.56 seconds)
@@ -554,13 +565,16 @@ python example.py
 conda activate base
 pip install -r requirements.txt
 
-# 2. Start LLM server (ensure model is downloaded first)
+# 2. Download the default model (Llama-3.1-8B-Instruct)
+python scripts/download_model.py --preset llama3
+
+# 3. Start LLM server (loads Llama-3.1-8B-Instruct by default)
 python scripts/start_llm_server.py &
 
-# 3. Download dataset
+# 4. Download dataset
 python data/download_har_dataset.py
 
-# 4. Run the agent
+# 5. Run the agent
 python dsp_agent.py data/samples/imu_walking_subject1.csv \
     "Analyze this signal. What activity? What is the step frequency?"
 ```
