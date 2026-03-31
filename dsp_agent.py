@@ -2,15 +2,17 @@
 
 The LLM (OPT-6.7B served locally) acts as a planner:
   1. Reads the user's goal and signal metadata
-  2. Plans which DSP tools to apply
+  2. Plans which DSP tools to apply (and which descriptors to use for output formatting)
   3. Executes the tools
-  4. Summarizes and interprets results
-  5. Decides if more analysis is needed (loop) or done
+  4. Observe node runs descriptors on raw results to produce LLM-readable observations
+  5. Summarizes and interprets results
+  6. Decides if more analysis is needed (loop) or done
 
 LangGraph StateGraph with:
   - load_signal: Read CSV into state
-  - plan: LLM decides next DSP step
+  - plan: LLM decides next DSP step and specifies output descriptors
   - execute_tool: Run the chosen DSP tool
+  - observe: Run descriptor tools on raw results, produce formatted observations
   - summarize: LLM interprets all results and answers the user's question
 """
 
@@ -30,6 +32,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from llm_client import LLHTTPClient
 from tools.scipy_tool import SciPyDSPTool, TOOL_REGISTRY
 from tools.imufusion_tool import IMUFusionTool, IMU_TOOL_REGISTRY
+from tools.descriptor_tool import DescriptorTool, DESCRIPTOR_REGISTRY
 
 # ---------------------------------------------------------------------------
 # State definition
@@ -54,9 +57,14 @@ class AgentState(TypedDict):
     tool_queue: list             # list of tool calls to execute
     current_tool: dict           # the tool being executed now
     tool_results: list           # accumulated results from all tools
+    results_per_iteration: list  # number of tool results added per iteration (for slicing)
     intermediate_results: dict   # name → np.ndarray from previous tool outputs (for chaining)
     iteration: int               # current planning iteration
     max_iterations: int          # safety limit
+
+    # Descriptor & Observe
+    descriptor_queue: list       # parsed descriptor calls from plan
+    observations: list           # formatted observation strings from observe node
 
     # Conversation trace (LangChain messages between nodes)
     messages: Annotated[list, add_messages]
@@ -71,6 +79,7 @@ class AgentState(TypedDict):
 # ---------------------------------------------------------------------------
 
 dsp = SciPyDSPTool()
+descriptor = DescriptorTool()
 try:
     imu_fusion = IMUFusionTool()
 except ImportError:
@@ -130,7 +139,7 @@ def _load_prompt(name: str) -> str:
 
 def get_llm_client() -> LLHTTPClient:
     host = os.environ.get("LLM_HOST", "localhost")
-    port = int(os.environ.get("LLM_PORT", "8080"))
+    port = int(os.environ.get("LLM_PORT", "8081"))
     return LLHTTPClient(host=host, port=port, timeout=300)
 
 
@@ -147,20 +156,48 @@ def call_llm(prompt: str, max_tokens: int = 1024, temperature: float = 0.3,
 
 
 def format_tool_list() -> str:
-    """Format available tools as a numbered list for the LLM prompt."""
+    """Format available tools as a tabular list with exact names for the LLM prompt.
+    
+    Long IMU tool names also show a short alias that the system accepts.
+    """
+    # Build reverse alias map: canonical name -> shortest alias
+    _shortest_alias: Dict[str, str] = {}
+    for alias, canonical in _TOOL_ALIASES.items():
+        if canonical not in _shortest_alias or len(alias) < len(_shortest_alias[canonical]):
+            _shortest_alias[canonical] = alias
+
+    # Find the longest tool name for alignment
+    max_name_len = max(len(name) for name in TOOL_REGISTRY)
     lines = []
-    for i, (name, info) in enumerate(TOOL_REGISTRY.items(), 1):
-        lines.append(f"{i}. {name}: {info['description']}")
+    for name, info in TOOL_REGISTRY.items():
+        # Extract args list, excluding 'data' (always implicit)
+        args = [a for a in info.get("args", []) if a != "data"]
+        desc = info["description"].split(".")[0]  # First sentence only
+        if args:
+            args_str = f"  ARGS: {', '.join(args)}"
+        else:
+            args_str = ""
+        # Show short alias for long names
+        alias_hint = ""
+        if name in _shortest_alias:
+            alias_hint = f"  (or: {_shortest_alias[name]})"
+        lines.append(f"  {name:<{max_name_len}}  — {desc}.{args_str}{alias_hint}")
     return "\n".join(lines)
 
 
 def parse_tool_calls(llm_text: str) -> List[Dict[str, Any]]:
     """Parse tool calls from LLM output.
     
-    Expected format from LLM:
+    Expected format from LLM (with THINK/PIPELINE/TOOLS sections):
+      THINK:
+      (reasoning text — skipped by parser)
+      PIPELINE:
+      Step 1: input -> tool_name(params) -> output
+      (pipeline text — skipped by parser)
+      TOOLS:
       TOOL: tool_name
       ARGS: arg1=value1, arg2=value2
-      DATA: acc|gyro|magnitude
+      DATA: acc|gyro|intermediate_name
     or
       DONE
     """
@@ -169,13 +206,24 @@ def parse_tool_calls(llm_text: str) -> List[Dict[str, Any]]:
     # Normalize LLM text: remove markdown escapes, extra whitespace
     cleaned = llm_text.replace("\\", "").replace("`", "").replace("*", "")
 
+    def _normalise_data_source(raw: str) -> str:
+        """Clean a raw DATA: capture into a normalised source name."""
+        # Remove trailing keywords/phrases like "Data Source", "specific axis"
+        s = re.split(r'\b(?:data\s*source|specific|axis|for|from|the|and|of)\b', raw, maxsplit=1, flags=re.IGNORECASE)[0]
+        # Remove non-alpha chars, collapse whitespace/underscores
+        s = re.sub(r'[^a-z0-9 _]', '', s.lower())
+        s = re.sub(r'[\s_]+', '_', s).strip('_')
+        return s if s else "acc"
+
     # Try to find TOOL: lines (handles "Tool:", "TOOL:", "ToOL:" etc.)
+    # Capture everything after the colon up to a newline so we can normalise
+    # names that the LLM splits with spaces (e.g. "im u_linear_acceleratoin").
     tool_pattern = re.compile(
-        r'tool\s*:\s*(\w+)',
+        r'tool\s*:\s*([^\n]+)',
         re.IGNORECASE
     )
     data_pattern = re.compile(
-        r'data\s*:\s*(\w+)',
+        r'data\s*(?:source)?\s*:\s*([^\n]+)',
         re.IGNORECASE
     )
     args_pattern = re.compile(
@@ -183,19 +231,59 @@ def parse_tool_calls(llm_text: str) -> List[Dict[str, Any]]:
         re.IGNORECASE
     )
 
+    # Section header patterns for OBSERVE/THINK/PIPELINE/TOOLS/DESCRIPTORS
+    section_header = re.compile(r'^(observe|think|pipeline|tools|descriptors)\s*:', re.IGNORECASE)
+
     # Split into lines and parse line by line
     lines = cleaned.split("\n")
     current_tool = None
     current_args = {}
     current_data = "acc"
 
+    # Skip THINK and PIPELINE sections — only parse lines after reaching
+    # the TOOLS: header (or the first TOOL: match if no header is found).
+    in_preamble = True
     for line in lines:
+        stripped = line.strip()
+
+        # Detect section headers to track where we are
+        header_match = section_header.match(stripped)
+        if header_match:
+            section_name = header_match.group(1).lower()
+            if section_name == "tools":
+                in_preamble = False
+            else:
+                # Inside THINK or PIPELINE — keep skipping
+                in_preamble = True
+            continue
+
+        # While in THINK/PIPELINE preamble, skip lines unless we see a
+        # direct TOOL: match (handles cases where LLM omits the TOOLS: header)
+        if in_preamble:
+            if tool_pattern.search(stripped):
+                in_preamble = False
+            else:
+                continue
+
         tool_match = tool_pattern.search(line)
         if tool_match:
             # Save previous tool if exists
             if current_tool:
                 tools.append({"tool": current_tool, "args": current_args, "data_source": current_data})
-            raw_name = tool_match.group(1).strip().lower()
+
+            # Extract and normalise the tool name.  The capture group may
+            # contain the full rest-of-line, e.g.
+            #   "im u_linear_acceleratoin ARGS: cutoff=5"
+            # Strategy: strip trailing keywords, remove non-alpha chars,
+            # collapse whitespace/underscores into single underscores.
+            raw_tail = tool_match.group(1).strip().lower()
+            # Chop off anything from the first ARGS/DATA/DONE keyword onward
+            raw_tail = re.split(r'\b(?:args?|data|done)\b', raw_tail, maxsplit=1, flags=re.IGNORECASE)[0]
+            # Remove markdown cruft, punctuation, special chars — keep letters, digits, spaces, underscores
+            raw_tail = re.sub(r'[^a-z0-9 _]', '', raw_tail)
+            # Collapse whitespace + underscores into single underscores
+            raw_name = re.sub(r'[\s_]+', '_', raw_tail).strip('_')
+
             # Fuzzy match against registry
             matched = _fuzzy_match_tool(raw_name)
             if matched is None:
@@ -215,7 +303,7 @@ def parse_tool_calls(llm_text: str) -> List[Dict[str, Any]]:
                     current_data = current_args.pop("_data_source")
             data_match = data_pattern.search(line[tool_match.end():])
             if data_match:
-                current_data = data_match.group(1).strip().lower()
+                current_data = _normalise_data_source(data_match.group(1))
             continue
 
         # Check for standalone ARGS/DATA lines
@@ -227,18 +315,22 @@ def parse_tool_calls(llm_text: str) -> List[Dict[str, Any]]:
                     current_data = current_args.pop("_data_source")
             data_match = data_pattern.search(line)
             if data_match:
-                current_data = data_match.group(1).strip().lower()
+                current_data = _normalise_data_source(data_match.group(1))
 
     # Don't forget the last tool
     if current_tool:
         tools.append({"tool": current_tool, "args": current_args, "data_source": current_data})
 
-    # Deduplicate tools (keep first occurrence)
-    seen_tools = set()
+    # Deduplicate tools — allow same tool name with different args/data_source
+    seen_keys = set()
     unique_tools = []
     for t in tools:
-        if t["tool"] and t["tool"] not in seen_tools:
-            seen_tools.add(t["tool"])
+        if not t["tool"]:
+            continue
+        # Build a dedup key from tool name + data source + args
+        dedup_key = (t["tool"], t.get("data_source", "acc"), tuple(sorted(t.get("args", {}).items())))
+        if dedup_key not in seen_keys:
+            seen_keys.add(dedup_key)
             unique_tools.append(t)
     tools = unique_tools
 
@@ -300,10 +392,35 @@ def _levenshtein(s: str, t: str) -> int:
     return prev[-1]
 
 
+# Short aliases for long tool names that the LLM consistently misspells.
+# Checked before fuzzy matching.
+_TOOL_ALIASES: Dict[str, str] = {
+    "linear_acc":       "imu_linear_acceleration",
+    "linear_accel":     "imu_linear_acceleration",
+    "linear_acceleration": "imu_linear_acceleration",
+    "earth_acc":        "imu_earth_acceleration",
+    "earth_accel":      "imu_earth_acceleration",
+    "earth_acceleration": "imu_earth_acceleration",
+    "orientation":      "imu_orientation",
+    "euler":            "imu_euler_angles",
+    "euler_angles":     "imu_euler_angles",
+    "gravity":          "imu_gravity",
+    "stats":            "compute_statistics",
+    "statistics":       "compute_statistics",
+    "magnitude":        "compute_magnitude",
+    "mag":              "compute_magnitude",
+    "sma":              "signal_magnitude_area",
+    "zcr":              "zero_crossing_rate",
+    "fft":              "fft_magnitude",
+    "peaks":            "peak_detection",
+}
+
+
 def _fuzzy_match_tool(raw_name: str) -> str | None:
     """Fuzzy match a (possibly misspelled) tool name to the registry.
 
     Match strategy (first match wins):
+    0. Alias match — check against _TOOL_ALIASES.
     1. Exact match against TOOL_REGISTRY keys.
     2. Normalized match — strip underscores/hyphens/spaces from both sides.
     3. Containment match — check if a registered tool name (normalized) is a
@@ -313,6 +430,18 @@ def _fuzzy_match_tool(raw_name: str) -> str | None:
     4. Typo match — allow up to 2 character edits (Levenshtein) between
        normalized names.  Only considered when names are similar length.
     """
+    # 0. Alias match — check short aliases first
+    if raw_name in _TOOL_ALIASES:
+        matched = _TOOL_ALIASES[raw_name]
+        print(f"  [Alias] '{raw_name}' -> '{matched}'")
+        return matched
+    # Also try normalised alias lookup
+    normalized_alias = raw_name.replace("_", "").replace("-", "").replace(" ", "")
+    for alias, target in _TOOL_ALIASES.items():
+        if alias.replace("_", "") == normalized_alias:
+            print(f"  [Alias] '{raw_name}' -> '{target}'")
+            return target
+
     # 1. Exact match
     if raw_name in TOOL_REGISTRY:
         return raw_name
@@ -361,6 +490,75 @@ def _fuzzy_match_tool(raw_name: str) -> str | None:
     return None
 
 
+def _fuzzy_match_data_source(raw_source: str, valid_sources: List[str]) -> str | None:
+    """Fuzzy match a (possibly garbled) data source name to a valid source.
+
+    The LLM often produces garbled data source names like 'filtered_',
+    'linear_accuracy', 'linear_acc'.  This function tries to recover the
+    intended source using the same multi-stage strategy as _fuzzy_match_tool.
+
+    *valid_sources* is the list of currently valid names — typically
+    ["acc", "gyro"] plus the keys of intermediate_results plus the
+    keys of _PREREQUISITE_TOOLS (canonical intermediate names).
+
+    Returns the matched source name, or None if no match is found.
+    """
+    raw = raw_source.strip().lower()
+
+    # 1. Exact match
+    if raw in valid_sources:
+        return raw
+
+    # 2. Normalised match — strip underscores/hyphens/spaces
+    normalized = raw.replace("_", "").replace("-", "").replace(" ", "")
+    for src in valid_sources:
+        if src.replace("_", "") == normalized:
+            print(f"  [FuzzyData] '{raw_source}' matched to '{src}'")
+            return src
+
+    # 3. Containment match — pick longest matching source name.
+    #    Require the shorter string to be at least 50% of the longer one
+    #    to avoid false positives like "acc" matching "linear_accuracy".
+    if len(normalized) >= 3:
+        best: str | None = None
+        best_len = 0
+        for src in valid_sources:
+            src_norm = src.replace("_", "")
+            if len(src_norm) < 3:
+                continue
+            shorter = min(len(src_norm), len(normalized))
+            longer = max(len(src_norm), len(normalized))
+            if shorter < longer * 0.5:
+                continue
+            if src_norm in normalized or normalized in src_norm:
+                if len(src_norm) > best_len:
+                    best = src
+                    best_len = len(src_norm)
+        if best is not None:
+            print(f"  [FuzzyData] '{raw_source}' matched to '{best}' (containment)")
+            return best
+
+    # 4. Typo match — Levenshtein distance <= 3 for similar-length names.
+    #    We allow a slightly larger distance than for tool names because
+    #    the LLM garbles intermediate data names more aggressively.
+    if len(normalized) >= 4:
+        best_typo: str | None = None
+        best_dist = 4  # threshold: accept dist <= 3
+        for src in valid_sources:
+            src_norm = src.replace("_", "")
+            if abs(len(src_norm) - len(normalized)) > 3:
+                continue
+            dist = _levenshtein(normalized, src_norm)
+            if dist < best_dist:
+                best_dist = dist
+                best_typo = src
+        if best_typo is not None:
+            print(f"  [FuzzyData] '{raw_source}' matched to '{best_typo}' (typo, dist={best_dist})")
+            return best_typo
+
+    return None
+
+
 def _parse_args(args_str: str) -> dict:
     """Parse argument string like 'fs=50, cutoff=10' into a dict.
 
@@ -383,7 +581,11 @@ def _parse_args(args_str: str) -> dict:
             # Only keep numeric args we care about
             if k in ("fs", "cutoff", "low", "high", "order", "nperseg", "height", "distance"):
                 try:
-                    args[k] = float(v)
+                    val = float(v)
+                    # SciPy expects these as int
+                    if k in ("order", "nperseg", "distance"):
+                        val = int(val)
+                    args[k] = val
                 except ValueError:
                     pass
     return args
@@ -393,6 +595,173 @@ def is_done(llm_text: str) -> bool:
     """Check if LLM says analysis is complete."""
     text_lower = llm_text.lower()
     return "done" in text_lower and "tool:" not in text_lower
+
+
+def parse_descriptor_calls(llm_text: str) -> List[Dict[str, Any]]:
+    """Parse descriptor calls from LLM output.
+
+    Expected format in the DESCRIPTORS: section:
+      DESCRIPTOR: descriptor_name
+      TOOL_REF: tool_name
+      ARGS: param=value, param2=value2
+
+    Returns a list of dicts:
+      [{"descriptor": "top_n_peaks", "tool_ref": "fft_magnitude", "args": {"n": 3}}, ...]
+    """
+    descriptors = []
+
+    # Normalize LLM text
+    cleaned = llm_text.replace("\\", "").replace("`", "").replace("*", "")
+
+    # Find the DESCRIPTORS: section
+    desc_section_match = re.search(r'descriptors\s*:', cleaned, re.IGNORECASE)
+    if not desc_section_match:
+        return []
+
+    # Extract text from DESCRIPTORS: header to end (or next major section)
+    section_text = cleaned[desc_section_match.end():]
+    # Stop at DONE or end of text
+    done_match = re.search(r'\bDONE\b', section_text, re.IGNORECASE)
+    if done_match:
+        section_text = section_text[:done_match.start()]
+
+    descriptor_pattern = re.compile(r'descriptor\s*:\s*([^\n]+)', re.IGNORECASE)
+    tool_ref_pattern = re.compile(r'tool_ref\s*:\s*([^\n]+)', re.IGNORECASE)
+    args_pattern = re.compile(r'args?\s*:\s*([^\n]+)', re.IGNORECASE)
+
+    current_desc = None
+    current_tool_ref = None
+    current_args = {}
+
+    for line in section_text.split("\n"):
+        stripped = line.strip()
+
+        desc_match = descriptor_pattern.search(stripped)
+        if desc_match:
+            # Save previous descriptor if exists
+            if current_desc and current_tool_ref:
+                descriptors.append({
+                    "descriptor": current_desc,
+                    "tool_ref": current_tool_ref,
+                    "args": current_args,
+                })
+
+            raw_name = desc_match.group(1).strip().lower()
+            raw_name = re.sub(r'[^a-z0-9 _]', '', raw_name)
+            raw_name = re.sub(r'[\s_]+', '_', raw_name).strip('_')
+            current_desc = _fuzzy_match_descriptor(raw_name)
+            current_tool_ref = None
+            current_args = {}
+            continue
+
+        ref_match = tool_ref_pattern.search(stripped)
+        if ref_match and current_desc:
+            raw_ref = ref_match.group(1).strip().lower()
+            raw_ref = re.sub(r'[^a-z0-9 _]', '', raw_ref)
+            raw_ref = re.sub(r'[\s_]+', '_', raw_ref).strip('_')
+            # Fuzzy match against tool registry
+            matched = _fuzzy_match_tool(raw_ref)
+            current_tool_ref = matched if matched else raw_ref
+            continue
+
+        args_match = args_pattern.search(stripped)
+        if args_match and current_desc:
+            current_args = _parse_descriptor_args(args_match.group(1))
+            continue
+
+    # Don't forget the last descriptor
+    if current_desc and current_tool_ref:
+        descriptors.append({
+            "descriptor": current_desc,
+            "tool_ref": current_tool_ref,
+            "args": current_args,
+        })
+
+    return descriptors
+
+
+def _fuzzy_match_descriptor(raw_name: str) -> str | None:
+    """Fuzzy match a descriptor name against DESCRIPTOR_REGISTRY.
+
+    Uses the same multi-stage strategy as _fuzzy_match_tool.
+    """
+    # 1. Exact match
+    if raw_name in DESCRIPTOR_REGISTRY:
+        return raw_name
+
+    # 2. Normalized match
+    normalized = raw_name.replace("_", "").replace("-", "").replace(" ", "")
+    for registered in DESCRIPTOR_REGISTRY:
+        if registered.replace("_", "") == normalized:
+            return registered
+
+    # 3. Containment match
+    if len(normalized) >= 4:
+        best: str | None = None
+        best_len = 0
+        for registered in DESCRIPTOR_REGISTRY:
+            reg_norm = registered.replace("_", "")
+            if reg_norm in normalized or normalized in reg_norm:
+                if len(reg_norm) > best_len:
+                    best = registered
+                    best_len = len(reg_norm)
+        if best is not None:
+            return best
+
+    # 4. Typo match
+    if len(normalized) >= 4:
+        best_typo: str | None = None
+        best_dist = 3
+        for registered in DESCRIPTOR_REGISTRY:
+            reg_norm = registered.replace("_", "")
+            if abs(len(reg_norm) - len(normalized)) > 2:
+                continue
+            dist = _levenshtein(normalized, reg_norm)
+            if dist < best_dist:
+                best_dist = dist
+                best_typo = registered
+        if best_typo is not None:
+            return best_typo
+
+    print(f"  [Skip] No match for descriptor '{raw_name}'")
+    return None
+
+
+def _parse_descriptor_args(args_str: str) -> Dict[str, Any]:
+    """Parse descriptor argument string into a dict.
+
+    Handles: n=3, metrics=mean,std,rms, target_freq=1.5, bandwidth=0.5
+    """
+    args: Dict[str, Any] = {}
+    for part in re.split(r'[;]', args_str):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            k = k.strip().lower()
+            v = v.strip().strip("'\"")
+            if k == "metrics":
+                # Parse comma-separated metric names
+                args[k] = [m.strip() for m in v.split(",")]
+            elif k in ("n", "target_freq", "bandwidth"):
+                try:
+                    val = float(v)
+                    if k == "n":
+                        val = int(val)
+                    args[k] = val
+                except ValueError:
+                    pass
+    return args
+
+
+def format_descriptor_list() -> str:
+    """Format available descriptors as a list for the LLM prompt."""
+    lines = []
+    for name, info in DESCRIPTOR_REGISTRY.items():
+        args = info.get("args", [])
+        desc = info["description"]
+        args_str = f"  ARGS: {', '.join(args)}" if args else ""
+        lines.append(f"  {name} — {desc}{args_str}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -453,8 +822,11 @@ def load_signal(state: AgentState) -> dict:
         "fs": fs,
         "signal_info": signal_info,
         "tool_results": [],
+        "results_per_iteration": [],
         "intermediate_results": {},
         "plan_history": [],
+        "descriptor_queue": [],
+        "observations": [],
         "iteration": 0,
         "max_iterations": state.get("max_iterations", 5),
         "error": "",
@@ -471,30 +843,39 @@ def plan(state: AgentState) -> dict:
     tool_results = state.get("tool_results", [])
     plan_history = state.get("plan_history", [])
 
-    # Build context for LLM — feed full tool results (Mistral supports 32K tokens)
-    results_text = ""
-    if tool_results:
-        results_text = "\nPrevious results:\n"
-        for r in tool_results:
-            results_text += f"- {r['tool']}: {r['summary']}\n"
-
-    # Build plan history context so LLM can refine strategy across iterations
-    history_text = ""
-    if plan_history:
-        history_text = "\nYour previous plans:\n"
-        for i, prev_plan in enumerate(plan_history):
-            history_text += f"--- Iteration {i} ---\n{prev_plan}\n"
-
     # Build intermediate results listing so LLM knows what chained data is available
     intermediate_results = state.get("intermediate_results", {})
     intermediates_text = ""
     if intermediate_results:
-        intermediates_text = "\nAvailable intermediate data (use as DATA source for chaining):\n"
+        intermediates_text = "\nAVAILABLE INTERMEDIATE DATA (created by previous tools):\n"
         for name, arr in intermediate_results.items():
             if isinstance(arr, np.ndarray):
-                intermediates_text += f"- {name}  shape={arr.shape}\n"
+                intermediates_text += f"- \"{name}\"  shape={arr.shape}\n"
             else:
-                intermediates_text += f"- {name}\n"
+                intermediates_text += f"- \"{name}\"\n"
+
+    # Build explicit list of valid DATA sources
+    valid_intermediates = ""
+    if intermediate_results:
+        names = [f'"{name}"' for name in intermediate_results.keys()]
+        valid_intermediates = "- Intermediate data from previous tools: " + ", ".join(names) + "\n"
+
+    # --- Build observations text from the observe node ---
+    # On iteration 0 (first plan), there are no observations yet.
+    # On iteration 1+, observations come from the observe node's output.
+    observations_text = ""
+    observations_list = state.get("observations", [])
+    if observations_list:
+        # Build a cumulative observations section showing all iterations
+        obs_parts = []
+        for obs_idx, obs in enumerate(observations_list):
+            obs_parts.append(f"--- Iteration {obs_idx + 1} Results ---\n{obs}")
+        observations_text = "\n\n".join(obs_parts)
+        # Escape braces so str.format() doesn't choke on JSON in observations
+        observations_text = observations_text.replace("{", "{{").replace("}", "}}")
+
+    # On first iteration (no results yet), results_text is empty
+    results_text = ""
 
     # Load prompt template from prompts/plan.md
     template = _load_prompt("plan")
@@ -502,9 +883,11 @@ def plan(state: AgentState) -> dict:
         signal_info=state.get('signal_info', ''),
         user_goal=state['user_goal'],
         results_text=results_text,
-        plan_history=history_text,
         tool_list=format_tool_list(),
+        descriptor_list=format_descriptor_list(),
         intermediates_text=intermediates_text,
+        valid_intermediates=valid_intermediates,
+        observations=observations_text,
     )
 
     llm_response = call_llm(prompt, max_tokens=1024, temperature=0.2)
@@ -516,20 +899,23 @@ def plan(state: AgentState) -> dict:
             "plan": llm_response,
             "plan_history": plan_history + [llm_response],
             "tool_queue": [],
+            "descriptor_queue": [],
             "iteration": iteration + 1,
             "messages": [
                 AIMessage(content=f"[plan iter={iteration}] LLM says DONE.\n{llm_response}"),
             ],
         }
 
-    # Parse tool calls
+    # Parse tool calls and descriptor calls
     tools = parse_tool_calls(llm_response)
+    descriptors = parse_descriptor_calls(llm_response)
     tool_names = [t["tool"] for t in tools]
 
     return {
         "plan": llm_response,
         "plan_history": plan_history + [llm_response],
         "tool_queue": tools,
+        "descriptor_queue": descriptors,
         "iteration": iteration + 1,
         "messages": [
             AIMessage(content=f"[plan iter={iteration}] Tools chosen: {tool_names}\n{llm_response}"),
@@ -573,6 +959,21 @@ def execute_tool(state: AgentState) -> dict:
         tool_name = tool_call["tool"]
         args = tool_call.get("args", {})
         data_source = tool_call.get("data_source", "acc")
+
+        # --- Normalise garbled DATA source names --------------------------
+        # The LLM often garbles data source names (e.g. "filtered_",
+        # "linear_accuracy", "low pass_filter").  Apply the same
+        # normalisation we do for tool names, then fuzzy-match.
+        if data_source not in ("acc", "gyro") and data_source not in intermediate_results and data_source not in _PREREQUISITE_TOOLS:
+            # Normalise: strip markdown cruft, collapse spaces/underscores
+            ds_clean = re.sub(r'[^a-z0-9 _]', '', data_source.lower())
+            ds_clean = re.sub(r'[\s_]+', '_', ds_clean).strip('_')
+            # Build list of all currently valid sources
+            valid_sources = ["acc", "gyro"] + list(intermediate_results.keys()) + list(_PREREQUISITE_TOOLS.keys())
+            matched_ds = _fuzzy_match_data_source(ds_clean, valid_sources)
+            if matched_ds is not None:
+                data_source = matched_ds
+            # else: leave as-is; will hit the fallback-to-acc path below
 
         # Select data — check intermediate results first, then fall back to raw
         if data_source in intermediate_results:
@@ -729,6 +1130,11 @@ def execute_tool(state: AgentState) -> dict:
                 "raw": None,
             })
 
+    # Track how many results were added in this iteration
+    results_this_iteration = len(tool_results) - results_before
+    results_per_iteration = list(state.get("results_per_iteration", []))
+    results_per_iteration.append(results_this_iteration)
+
     # Build ToolMessages for conversation trace
     tool_messages = []
     for tr in tool_results[results_before:]:
@@ -741,6 +1147,7 @@ def execute_tool(state: AgentState) -> dict:
 
     return {
         "tool_results": tool_results,
+        "results_per_iteration": results_per_iteration,
         "tool_queue": [],
         "messages": tool_messages,
         "intermediate_results": intermediate_results,
@@ -768,6 +1175,132 @@ def _summarize_result(tool_name: str, result: Any, data_source: str) -> str:
         return f"{tool_name}={result:.4f}"
     else:
         return str(result)
+
+
+def observe(state: AgentState) -> dict:
+    """Run descriptor tools on raw results to produce LLM-readable observations.
+
+    For each descriptor in the queue, finds the matching tool result by
+    tool_ref name, runs the descriptor method on the raw result, and
+    collects the formatted output string.  Tools without a matching
+    descriptor get a fallback summary via _summarize_result().
+    """
+    descriptor_queue = state.get("descriptor_queue", [])
+    tool_results = state.get("tool_results", [])
+    results_per_iteration = state.get("results_per_iteration", [])
+    plan_history = state.get("plan_history", [])
+    iteration = state.get("iteration", 0)
+
+    # Get the most recent iteration's results
+    if results_per_iteration:
+        last_count = results_per_iteration[-1]
+        recent_results = tool_results[-last_count:] if last_count > 0 else []
+    else:
+        recent_results = tool_results
+
+    # Build a lookup: tool_name -> most recent result entry
+    result_by_tool: Dict[str, dict] = {}
+    for r in recent_results:
+        result_by_tool[r["tool"]] = r
+
+    # Track which tools have been described by a descriptor
+    described_tools = set()
+
+    observation_lines = []
+
+    # --- Run descriptors on matching tool results ---
+    for desc_call in descriptor_queue:
+        desc_name = desc_call.get("descriptor")
+        tool_ref = desc_call.get("tool_ref")
+        args = desc_call.get("args", {})
+
+        if not desc_name or not tool_ref:
+            continue
+
+        # Find the matching tool result
+        matched_result = result_by_tool.get(tool_ref)
+        if matched_result is None:
+            # Try fuzzy match against available tool result names
+            for t_name, t_entry in result_by_tool.items():
+                if t_name.replace("_", "") == tool_ref.replace("_", ""):
+                    matched_result = t_entry
+                    break
+
+        if matched_result is None:
+            observation_lines.append(
+                f"- {tool_ref}: [descriptor {desc_name} skipped — no matching tool result]"
+            )
+            continue
+
+        raw = matched_result.get("raw")
+        data_source = matched_result.get("data_source", "acc")
+
+        if raw is None:
+            # Fallback to summary
+            observation_lines.append(
+                f"- {tool_ref}({data_source}): {matched_result.get('summary', 'no result')}"
+            )
+            described_tools.add(tool_ref)
+            continue
+
+        # Run the descriptor method
+        try:
+            desc_method = getattr(descriptor, desc_name, None)
+            if desc_method is None:
+                observation_lines.append(
+                    f"- {tool_ref}({data_source}): [unknown descriptor '{desc_name}', using default]"
+                )
+                observation_lines.append(
+                    f"  {_summarize_result(tool_ref, raw, data_source)}"
+                )
+            else:
+                desc_output = desc_method(raw, **args)
+                observation_lines.append(f"- {tool_ref}({data_source}) [{desc_name}]:\n  {desc_output}")
+        except Exception as e:
+            observation_lines.append(
+                f"- {tool_ref}({data_source}): [descriptor error: {str(e)}]"
+            )
+            # Fallback to default summary
+            observation_lines.append(
+                f"  Default: {matched_result.get('summary', 'no result')}"
+            )
+
+        described_tools.add(tool_ref)
+
+    # --- Fallback: summarize tools that had no descriptor ---
+    for r in recent_results:
+        t_name = r["tool"]
+        if t_name not in described_tools:
+            data_source = r.get("data_source", "acc")
+            summary = r.get("summary", "no result")
+            # Truncate very long summaries
+            if len(summary) > 500:
+                summary = summary[:500] + "... [truncated]"
+            observation_lines.append(f"- {t_name}({data_source}): {summary}")
+
+    # --- Build the full observations text using the observe template ---
+    observations_text = "\n".join(observation_lines)
+
+    # Also include previous iterations' observations for context
+    previous_observations = list(state.get("observations", []))
+    previous_observations.append(observations_text)
+
+    # Build the full observe section using the template
+    observe_template = _load_prompt("observe")
+    full_observe_text = observe_template.format(
+        iteration=iteration,
+        iteration_observations=observations_text,
+    )
+
+    print(f"\n[Observe iteration {iteration}] Observations:\n{observations_text}\n")
+
+    return {
+        "observations": previous_observations,
+        "descriptor_queue": [],  # Clear after use
+        "messages": [
+            AIMessage(content=f"[observe iter={iteration}] Observations:\n{observations_text}"),
+        ],
+    }
 
 
 def summarize(state: AgentState) -> dict:
@@ -830,7 +1363,12 @@ def should_continue(state: AgentState) -> str:
 
 
 def after_execute(state: AgentState) -> str:
-    """After executing tools, go back to plan or summarize."""
+    """After executing tools, always go to observe node."""
+    return "observe"
+
+
+def after_observe(state: AgentState) -> str:
+    """After observing results, go back to plan or summarize."""
     iteration = state.get("iteration", 0)
     max_iter = state.get("max_iterations", 5)
 
@@ -853,6 +1391,7 @@ def build_agent() -> StateGraph:
     graph.add_node("load_signal", load_signal)
     graph.add_node("plan", plan)
     graph.add_node("execute_tool", execute_tool)
+    graph.add_node("observe", observe)
     graph.add_node("summarize", summarize)
 
     # Edges
@@ -862,7 +1401,8 @@ def build_agent() -> StateGraph:
         "execute_tool": "execute_tool",
         "summarize": "summarize",
     })
-    graph.add_conditional_edges("execute_tool", after_execute, {
+    graph.add_edge("execute_tool", "observe")
+    graph.add_conditional_edges("observe", after_observe, {
         "plan": "plan",
         "summarize": "summarize",
     })

@@ -16,7 +16,7 @@ import os
 import sys
 
 # Model directory can be set via the MODEL_DIR env var, otherwise a default path is used.
-MODEL_DIR = os.environ.get("MODEL_DIR") or os.path.join(os.path.dirname(__file__), "..", "models", "Mistral-7B-Instruct-v0.3")
+MODEL_DIR = os.environ.get("MODEL_DIR") or os.path.join(os.path.dirname(__file__), "..", "models", "Llama-3.1-8B-Instruct")
 
 
 def find_model_dir(root: str, max_depth: int = 3) -> str | None:
@@ -169,4 +169,4 @@ def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8081)

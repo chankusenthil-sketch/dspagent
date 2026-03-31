@@ -39,8 +39,8 @@ print(f"Logging to {log_filename}\n")
 # ── 1. Basic usage ──────────────────────────────────────────────────────────
 
 result = run_agent(
-    csv_path="data/samples/imu_walking_subject1.csv",
-    user_goal="Where is the device attached to person's body?",
+    csv_path="data/samples/imu_jogging_subject1.csv",
+    user_goal="What is the orientation of this device? Where this device might be located on the person's body? Is the person moving or stationary?",
     fs=50.0,                        # sampling rate in Hz
     max_iterations=3,               # max plan→execute loops
     thread_id=str(uuid.uuid4()),    # unique thread for checkpointing

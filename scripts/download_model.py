@@ -21,6 +21,11 @@ MODEL_PRESETS = {
         "local_dir": "Llama-2-13b-hf",
         "ignore_patterns": [],
     },
+    "llama3": {
+        "repo_id": "meta-llama/Llama-3.1-8B-Instruct",
+        "local_dir": "Llama-3.1-8B-Instruct",
+        "ignore_patterns": ["*.gguf", "*.ggml", "original/*"],
+    },
 }
 
 MODEL_ID_DEFAULT = "mistralai/Mistral-7B-Instruct-v0.3"
