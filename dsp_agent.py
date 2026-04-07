@@ -1,12 +1,16 @@
 """DSP Agent — LangGraph-based signal processing agent.
 
-The LLM (OPT-6.7B served locally) acts as a planner:
+The LLM (served locally — supports Mistral, Llama-2, Llama-3, etc.) acts as a planner:
   1. Reads the user's goal and signal metadata
   2. Plans which DSP tools to apply (and which descriptors to use for output formatting)
   3. Executes the tools
   4. Observe node runs descriptors on raw results to produce LLM-readable observations
   5. Summarizes and interprets results
   6. Decides if more analysis is needed (loop) or done
+
+Prompt templates are model-aware: PromptManager auto-detects the active model
+via the LLM server's /health endpoint and loads model-specific templates from
+prompts/<model_family>/ with fallback to prompts/base/.
 
 LangGraph StateGraph with:
   - load_signal: Read CSV into state
@@ -124,17 +128,136 @@ def _log_message(msg) -> None:
     conv_logger.info(f"[{role}] {content}")
 
 # ---------------------------------------------------------------------------
-# Prompt loading
+# Prompt loading — model-aware PromptManager
 # ---------------------------------------------------------------------------
 
 _PROMPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
 
+# Model family configuration: maps family name to its capabilities.
+_MODEL_FAMILY_CONFIG: Dict[str, Dict[str, Any]] = {
+    "llama3": {
+        "supports_system_role": True,
+        "max_context_tokens": 128000,
+    },
+    "llama2": {
+        "supports_system_role": False,
+        "max_context_tokens": 4096,
+    },
+    "mistral": {
+        "supports_system_role": True,
+        "max_context_tokens": 32000,
+    },
+}
 
-def _load_prompt(name: str) -> str:
-    """Load a prompt template from prompts/<name>.md."""
-    path = os.path.join(_PROMPT_DIR, f"{name}.md")
-    with open(path, "r") as f:
-        return f.read()
+
+class PromptManager:
+    """Loads model-specific prompt templates with fallback to base templates.
+
+    Template resolution order:
+      1. prompts/<model_family>/<name>.md  (if model family detected and file exists)
+      2. prompts/base/<name>.md            (default fallback)
+
+    Model family is auto-detected from the model directory path returned by
+    the LLM server's /health endpoint, or can be set explicitly.
+    """
+
+    def __init__(self, model_id: str | None = None):
+        self.model_family = self._detect_family(model_id)
+        self.base_dir = os.path.join(_PROMPT_DIR, "base")
+        self.model_dir = (
+            os.path.join(_PROMPT_DIR, self.model_family)
+            if self.model_family
+            else None
+        )
+        self._model_id = model_id or "unknown"
+
+    @staticmethod
+    def _detect_family(model_id: str | None) -> str | None:
+        """Parse a model directory path or repo ID into a family name."""
+        if not model_id:
+            return None
+        mid = model_id.lower()
+        if "llama-3" in mid or "llama3" in mid or "llama_3" in mid:
+            return "llama3"
+        if "llama-2" in mid or "llama2" in mid or "llama_2" in mid:
+            return "llama2"
+        if "mistral" in mid:
+            return "mistral"
+        return None
+
+    def load(self, name: str) -> str:
+        """Load a prompt template by name.
+
+        Checks the model-specific directory first, falls back to base/.
+        """
+        if self.model_dir:
+            model_path = os.path.join(self.model_dir, f"{name}.md")
+            if os.path.exists(model_path):
+                with open(model_path, "r") as f:
+                    return f.read()
+        base_path = os.path.join(self.base_dir, f"{name}.md")
+        with open(base_path, "r") as f:
+            return f.read()
+
+    @property
+    def supports_system_role(self) -> bool:
+        """Whether the model natively supports a 'system' message role."""
+        cfg = _MODEL_FAMILY_CONFIG.get(self.model_family or "", {})
+        return cfg.get("supports_system_role", False)
+
+    @property
+    def max_context_tokens(self) -> int:
+        """Maximum context window size for the detected model family."""
+        cfg = _MODEL_FAMILY_CONFIG.get(self.model_family or "", {})
+        return cfg.get("max_context_tokens", 32000)
+
+    def __repr__(self) -> str:
+        return (
+            f"PromptManager(model_id={self._model_id!r}, "
+            f"family={self.model_family!r}, "
+            f"system_role={self.supports_system_role}, "
+            f"context={self.max_context_tokens})"
+        )
+
+
+def _detect_model_from_server() -> str | None:
+    """Query the LLM server /health endpoint to discover the active model.
+
+    Returns the model_dir string from the server, or None if unreachable.
+    """
+    try:
+        host = os.environ.get("LLM_HOST", "localhost")
+        port = int(os.environ.get("LLM_PORT", "8081"))
+        import requests as _requests
+        resp = _requests.get(f"http://{host}:{port}/health", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        model_dir = data.get("model_dir", "")
+        if model_dir:
+            print(f"[PromptManager] Detected model from server: {model_dir}")
+            return model_dir
+    except Exception as e:
+        print(f"[PromptManager] Could not query LLM server /health: {e}")
+    return None
+
+
+# Module-level singleton — initialised lazily on first use.
+_prompt_mgr: PromptManager | None = None
+
+
+def get_prompt_manager() -> PromptManager:
+    """Return the global PromptManager, creating it on first call.
+
+    Detection order:
+      1. LLM server /health endpoint (auto-detect which model is loaded).
+      2. Falls back to base prompts if server is unreachable.
+    """
+    global _prompt_mgr
+    if _prompt_mgr is None:
+        model_id = _detect_model_from_server()
+        _prompt_mgr = PromptManager(model_id=model_id)
+        print(f"[PromptManager] Initialized: {_prompt_mgr}")
+    return _prompt_mgr
 
 
 def get_llm_client() -> LLHTTPClient:
@@ -145,10 +268,19 @@ def get_llm_client() -> LLHTTPClient:
 
 def call_llm(prompt: str, max_tokens: int = 1024, temperature: float = 0.3,
              system: str = None) -> str:
-    """Call local LLM via chat endpoint and return response text."""
+    """Call local LLM via chat endpoint and return response text.
+
+    If the active model supports a system role (e.g. Llama-3, Mistral),
+    the system prompt is sent as a proper {"role": "system"} message.
+    Otherwise it is concatenated into the user message.
+    """
     client = get_llm_client()
+    pm = get_prompt_manager()
     messages = []
-    if system:
+    if system and pm.supports_system_role:
+        messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+    elif system:
         messages.append({"role": "user", "content": system + "\n\n" + prompt})
     else:
         messages.append({"role": "user", "content": prompt})
@@ -877,8 +1009,8 @@ def plan(state: AgentState) -> dict:
     # On first iteration (no results yet), results_text is empty
     results_text = ""
 
-    # Load prompt template from prompts/plan.md
-    template = _load_prompt("plan")
+    # Load prompt template (model-specific with fallback to base)
+    template = get_prompt_manager().load("plan")
     prompt = template.format(
         signal_info=state.get('signal_info', ''),
         user_goal=state['user_goal'],
@@ -1157,7 +1289,7 @@ def execute_tool(state: AgentState) -> dict:
 def _summarize_result(tool_name: str, result: Any, data_source: str) -> str:
     """Create a concise text summary of a tool result for LLM consumption."""
     if isinstance(result, dict):
-        # Include full data — Mistral-7B supports 32K context
+        # Include full data for LLM consumption
         summary_dict = {}
         for k, v in result.items():
             if isinstance(v, np.ndarray):
@@ -1283,14 +1415,14 @@ def observe(state: AgentState) -> dict:
 
     # Also include previous iterations' observations for context
     previous_observations = list(state.get("observations", []))
-    previous_observations.append(observations_text)
 
-    # Build the full observe section using the template
-    observe_template = _load_prompt("observe")
-    full_observe_text = observe_template.format(
+    # Format observations through the model-specific observe template
+    observe_template = get_prompt_manager().load("observe")
+    formatted_observation = observe_template.format(
         iteration=iteration,
         iteration_observations=observations_text,
     )
+    previous_observations.append(formatted_observation)
 
     print(f"\n[Observe iteration {iteration}] Observations:\n{observations_text}\n")
 
@@ -1313,14 +1445,14 @@ def summarize(state: AgentState) -> dict:
         seen[r["tool"]] = r
     unique_results = list(seen.values())
 
-    # Feed full results — Mistral-7B supports 32K context
+    # Feed full results to the LLM for summarization
     results_lines = []
     for r in unique_results:
         results_lines.append(f"- {r['tool']}: {r['summary']}")
     results_text = "\n".join(results_lines)
 
-    # Load prompt template from prompts/summarize.md
-    template = _load_prompt("summarize")
+    # Load prompt template (model-specific with fallback to base)
+    template = get_prompt_manager().load("summarize")
     prompt = template.format(
         signal_info=state.get('signal_info', ''),
         user_goal=state['user_goal'],
